@@ -49,3 +49,6 @@ internal_docs/
 *.flatpak
 /flatpak-repo/
 /.idea/
+
+# Native macOS bridge host build output
+tools/pjarczak_bambu_linux_host/.build-macos-host/

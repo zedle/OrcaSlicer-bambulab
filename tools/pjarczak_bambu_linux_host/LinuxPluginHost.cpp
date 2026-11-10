@@ -18,6 +18,10 @@
 #include <iostream>
 #include <filesystem>
 #include <unistd.h>
+#if PJARCZAK_MAC_NATIVE_HOST
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#endif
 
 using namespace std::chrono_literals;
 
@@ -87,6 +91,73 @@ std::string env_or(const char* name, const char* fallback)
         return v;
     return fallback;
 }
+
+#if PJARCZAK_MAC_NATIVE_HOST
+// Native macOS host: load Bambu Studio's own Mach-O plug-in in-process instead of a Linux .so in a VM.
+std::filesystem::path host_plugin_folder()
+{
+    if (const char* v = std::getenv("PJARCZAK_BAMBU_PLUGIN_DIR"); v && *v)
+        return v;
+    return std::filesystem::path(env_or("HOME", "")) / "Library/Application Support/BambuStudio/plugins";
+}
+std::string host_network_library_name() { return "libbambu_networking.dylib"; }
+std::string host_source_library_name() { return "libBambuSource.dylib"; }
+
+// Only load a plug-in that carries a valid signature from Bambu Lab's Apple team; it runs with our process's rights.
+bool validate_host_payload_file(const std::string& file_path, std::string* reason)
+{
+    const std::string team = env_or("PJARCZAK_BAMBU_PLUGIN_TEAM_ID", "T3UBR9Y3B2");
+    const std::string requirement_text = "anchor apple generic and certificate leaf[subject.OU] = \"" + team + "\"";
+    auto fail = [&](std::string why) { if (reason) *reason = std::move(why); return false; };
+
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(file_path.c_str()), CFIndex(file_path.size()), false);
+    if (!url)
+        return fail("bad plug-in path");
+    SecStaticCodeRef code = nullptr;
+    OSStatus status = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code);
+    CFRelease(url);
+    if (status != errSecSuccess)
+        return fail("plug-in not found or unreadable (OSStatus " + std::to_string(status) + ")");
+    CFStringRef req_string = CFStringCreateWithCString(nullptr, requirement_text.c_str(), kCFStringEncodingUTF8);
+    SecRequirementRef requirement = nullptr;
+    status = SecRequirementCreateWithString(req_string, kSecCSDefaultFlags, &requirement);
+    CFRelease(req_string);
+    if (status == errSecSuccess)
+        status = SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures, requirement);
+    if (requirement)
+        CFRelease(requirement);
+    CFRelease(code);
+    if (status != errSecSuccess)
+        return fail("plug-in is not signed by Bambu Lab team " + team + " (OSStatus " + std::to_string(status) + ")");
+    if (reason)
+        *reason = "ok";
+    return true;
+}
+#else
+std::filesystem::path host_plugin_folder() { return std::filesystem::path(env_or("PJARCZAK_BAMBU_PLUGIN_DIR", ".")); }
+std::string host_network_library_name() { return linux_network_library_name(); }
+std::string host_source_library_name() { return linux_source_library_name(); }
+bool validate_host_payload_file(const std::string& file_path, std::string* reason) { return validate_linux_payload_file(file_path, reason); }
+#endif
+
+#if PJARCZAK_MAC_NATIVE_HOST
+// PrintParams is compiled for one plug-in layout, so an environment override must not widen it:
+// a newer Studio plug-in is refused until the host is rebuilt for it.
+std::string host_expected_abi_version() { return BAMBU_NETWORK_AGENT_VERSION; }
+bool host_abi_matches(const std::string& actual, std::string* reason)
+{
+    const std::string expected = host_expected_abi_version();
+    if (actual.size() >= 8 && actual.compare(0, 8, expected, 0, 8) == 0) {
+        if (reason) *reason = "ok";
+        return true;
+    }
+    if (reason) *reason = "ABI version mismatch: this macOS host is built for " + expected.substr(0, 8) + ".xx, plug-in is " + (actual.empty() ? std::string("unknown") : actual) + "; rebuild the host for it";
+    return false;
+}
+#else
+std::string host_expected_abi_version() { return expected_network_abi_version(); }
+bool host_abi_matches(const std::string& actual, std::string* reason) { return abi_version_matches_expected(actual, reason); }
+#endif
 
 std::mutex g_host_log_mutex;
 
@@ -299,6 +370,12 @@ BBL::PrintParams print_params_from_json(const nlohmann::json& j)
     p.extruder_cali_manual_mode = j.value("extruder_cali_manual_mode", -1);
     p.task_ext_change_assist = j.value("task_ext_change_assist", false);
     p.try_emmc_print = j.value("try_emmc_print", false);
+#if PJARCZAK_BAMBU_NETWORK_ABI_0209
+    p.task_timelapse_use_internal = j.value("task_timelapse_use_internal", false);
+    p.svc_context = j.value("svc_context", std::string());
+    p.slicer_uid = j.value("slicer_uid", std::string());
+    p.queue_plate_id = j.value("queue_plate_id", std::string());
+#endif
     translate_print_params_paths(p);
     return p;
 }
@@ -500,7 +577,14 @@ bool LinuxPluginHost::consume_thread_reply_binary(std::vector<unsigned char>& ou
 
 void LinuxPluginHost::load_modules()
 {
-    const std::filesystem::path plugin_folder = std::filesystem::path(env_or("PJARCZAK_BAMBU_PLUGIN_DIR", "."));
+    const std::filesystem::path plugin_folder = host_plugin_folder();
+#if PJARCZAK_MAC_NATIVE_HOST
+    const std::string default_network_path = (plugin_folder / host_network_library_name()).string();
+    const std::string default_source_path = (plugin_folder / host_source_library_name()).string();
+#else
+    const std::string default_network_path = "libbambu_networking.so";
+    const std::string default_source_path = "libBambuSource.so";
+#endif
     std::string manifest_reason;
     const bool have_manifest = path_exists(linux_payload_manifest_path(plugin_folder));
     const bool manifest_ok = !have_manifest || validate_linux_payload_set_against_manifest(plugin_folder, &manifest_reason);
@@ -511,11 +595,11 @@ void LinuxPluginHost::load_modules()
     }
 
     if (!m_network) {
-        const auto path = env_or("PJARCZAK_BAMBU_NETWORK_SO", "libbambu_networking.so");
+        const auto path = env_or("PJARCZAK_BAMBU_NETWORK_SO", default_network_path.c_str());
         std::string reason;
         if (!manifest_ok) {
             m_network_status = "manifest invalid: " + manifest_reason;
-        } else if (!validate_linux_payload_file(path, &reason)) {
+        } else if (!validate_host_payload_file(path, &reason)) {
             m_network_status = "validate failed: " + reason;
         } else {
             m_network = dlopen(path.c_str(), RTLD_LAZY);
@@ -529,7 +613,7 @@ void LinuxPluginHost::load_modules()
                     std::string abi_reason;
                     const auto actual = gv();
                     m_network_actual_abi_version = actual;
-                    if (!abi_version_matches_expected(actual, &abi_reason)) {
+                    if (!host_abi_matches(actual, &abi_reason)) {
                         dlclose(m_network);
                         m_network = nullptr;
                         m_network_status = abi_reason;
@@ -538,7 +622,14 @@ void LinuxPluginHost::load_modules()
                     }
                 } else {
                     m_network_actual_abi_version.clear();
+#if PJARCZAK_MAC_NATIVE_HOST
+                    // An unversioned plug-in can't be matched to the compiled PrintParams layout.
+                    dlclose(m_network);
+                    m_network = nullptr;
+                    m_network_status = "plug-in reports no version; refusing to load";
+#else
                     m_network_status = "loaded";
+#endif
                 }
             }
         }
@@ -547,11 +638,11 @@ void LinuxPluginHost::load_modules()
     }
 
     if (!m_source) {
-        const auto path = env_or("PJARCZAK_BAMBU_SOURCE_SO", "libBambuSource.so");
+        const auto path = env_or("PJARCZAK_BAMBU_SOURCE_SO", default_source_path.c_str());
         std::string reason;
         if (!manifest_ok) {
             m_source_status = "manifest invalid: " + manifest_reason;
-        } else if (!validate_linux_payload_file(path, &reason)) {
+        } else if (!validate_host_payload_file(path, &reason)) {
             m_source_status = "validate failed: " + reason;
         } else {
             m_source = dlopen(path.c_str(), RTLD_LAZY);
@@ -730,17 +821,17 @@ nlohmann::json LinuxPluginHost::handle(const std::string& method, const nlohmann
         return {{"ok", true}, {"value", 0}, {"result", refresh_agora_url_ptr_string()}};
     }
     if (method == "bridge.handshake") {
-        const std::filesystem::path plugin_folder = std::filesystem::path(env_or("PJARCZAK_BAMBU_PLUGIN_DIR", "."));
+        const std::filesystem::path plugin_folder = host_plugin_folder();
         nlohmann::json out = nlohmann::json::object();
         out["ok"] = true;
         out["protocol_version"] = 1;
         out["bridge_version"] = "PJ-LINUX-BRIDGE-0.5";
-        out["network_abi_version"] = expected_network_abi_version();
+        out["network_abi_version"] = host_expected_abi_version();
         out["network_actual_abi_version"] = m_network_actual_abi_version;
         out["guest_arch"] = host_arch_string();
         out["plugin_dir"] = plugin_folder.string();
-        out["network_so_present"] = path_exists(plugin_folder / linux_network_library_name());
-        out["source_so_present"] = path_exists(plugin_folder / linux_source_library_name());
+        out["network_so_present"] = path_exists(plugin_folder / host_network_library_name());
+        out["source_so_present"] = path_exists(plugin_folder / host_source_library_name());
         out["manifest_present"] = path_exists(plugin_folder / linux_payload_manifest_file_name());
         out["network_loaded"] = m_network != nullptr;
         out["source_loaded"] = m_source != nullptr;

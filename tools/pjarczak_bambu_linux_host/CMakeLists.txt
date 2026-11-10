@@ -49,6 +49,26 @@ function(add_host_variant target_name abi_value)
     endif()
 endfunction()
 
-add_host_variant(pjarczak_bambu_linux_host_abi1 1)
-add_host_variant(pjarczak_bambu_linux_host_abi0 0)
-add_custom_target(pjarczak_bambu_linux_host DEPENDS pjarczak_bambu_linux_host_abi1 pjarczak_bambu_linux_host_abi0)
+if (APPLE)
+    # Native macOS host: runs the same RPC host directly against Bambu Studio's Mach-O
+    # libbambu_networking.dylib (02.09.01 ABI), so no Linux VM is needed.
+    find_package(Boost REQUIRED CONFIG)
+    add_executable(pjarczak_bambu_mac_host ${HOST_SOURCES})
+    set_target_properties(pjarczak_bambu_mac_host PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/pjarczak_bambu_linux_host")
+    target_include_directories(pjarczak_bambu_mac_host PRIVATE
+        "${REPO_ROOT}" "${REPO_ROOT}/src" "${REPO_ROOT}/deps_src")
+    target_compile_definitions(pjarczak_bambu_mac_host PRIVATE
+        PJARCZAK_LINUX_BRIDGE_STANDALONE_HOST=1
+        PJARCZAK_LINUX_BRIDGE_LIGHTWEIGHT_TASKS=1
+        PJARCZAK_MAC_NATIVE_HOST=1
+        PJARCZAK_BAMBU_NETWORK_ABI_0209=1
+        BAMBU_NETWORK_AGENT_VERSION="02.09.01.54")
+    target_link_libraries(pjarczak_bambu_mac_host PRIVATE
+        Threads::Threads OpenSSL::Crypto Boost::headers
+        "-framework CoreFoundation" "-framework Security")
+else()
+    add_host_variant(pjarczak_bambu_linux_host_abi1 1)
+    add_host_variant(pjarczak_bambu_linux_host_abi0 0)
+    add_custom_target(pjarczak_bambu_linux_host DEPENDS pjarczak_bambu_linux_host_abi1 pjarczak_bambu_linux_host_abi0)
+endif()

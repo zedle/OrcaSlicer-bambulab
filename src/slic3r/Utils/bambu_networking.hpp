@@ -248,6 +248,9 @@ struct PrintParams {
     bool task_vibration_cali;
     bool task_layer_inspect;
     bool task_record_timelapse;
+#if PJARCZAK_BAMBU_NETWORK_ABI_0209
+    bool task_timelapse_use_internal;
+#endif
     bool task_use_ams;
     std::string task_bed_type;
     std::string extra_options;
@@ -257,6 +260,12 @@ struct PrintParams {
     int extruder_cali_manual_mode{-1};
     bool task_ext_change_assist;
     bool try_emmc_print;
+#if PJARCZAK_BAMBU_NETWORK_ABI_0209
+    // Bambu Studio 02.09.01 plug-in layout (macOS native host loads Studio's own dylib).
+    std::string svc_context;
+    std::string slicer_uid;
+    std::string queue_plate_id;
+#endif
 };
 
 struct TaskQueryParams {

@@ -63,7 +63,12 @@ int main(int argc, char** argv)
         return 100;
     std::fflush(stdout);
     ::dup2(STDERR_FILENO, STDOUT_FILENO);
-    std::ofstream rpc_out(std::string("/proc/self/fd/") + std::to_string(rpc_fd), std::ios::binary | std::ios::out);
+#if defined(__APPLE__)
+    const char* fd_dir = "/dev/fd/"; // macOS has no /proc
+#else
+    const char* fd_dir = "/proc/self/fd/";
+#endif
+    std::ofstream rpc_out(std::string(fd_dir) + std::to_string(rpc_fd), std::ios::binary | std::ios::out);
     if (!rpc_out.good())
         return 101;
 
